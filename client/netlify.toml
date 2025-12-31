@@ -3,6 +3,15 @@
   publish = "dist"
   command = "npm run build"
 
+# 1. Proxy API requests to the Backend (Render)
+# Replace 'https://your-render-url.onrender.com' with your ACTUAL Render URL after you create it.
+[[redirects]]
+  from = "/api/*"
+  to = "https://intern.onrender.com/api/:splat"
+  status = 200
+  force = true
+
+# 2. Redirect all other traffic to index.html for React Router
 [[redirects]]
   from = "/*"
   to = "/index.html"
