@@ -28,8 +28,8 @@ db.init = () => {
         alasql("INSERT INTO bases (name, location) VALUES ('Command HQ', 'Capital')");
 
         alasql("INSERT INTO users (username, password, role, base_id) VALUES ('admin', 'admin123', 'admin', 3)");
-        alasql("INSERT INTO users (username, password, role, base_id) VALUES ('logistics', 'pass123', 'logistics', 2)");
-        alasql("INSERT INTO users (username, password, role, base_id) VALUES ('commander', 'pass123', 'commander', 1)");
+        alasql("INSERT INTO users (username, password, role, base_id) VALUES ('logistics_bravo', 'pass123', 'logistics', 2)");
+        alasql("INSERT INTO users (username, password, role, base_id) VALUES ('commander_alpha', 'pass123', 'commander', 1)");
 
         alasql("INSERT INTO assets (name, type, description) VALUES ('M4 Carbine', 'weapon', 'Standard issue rifle')");
         alasql("INSERT INTO assets (name, type, description) VALUES ('Humvee', 'vehicle', 'Tactical transport')");
@@ -58,7 +58,13 @@ const dbGet = (sql, params) => {
 // Helper for 'all' (multiple rows)
 const dbAll = (sql, params) => {
     // Alasql params are array. If sql uses '?', Alasql expects [val, val]
-    return alasql(sql, params);
+    try {
+        // console.log("Executing SQL:", sql, "Params:", params);
+        return alasql(sql, params);
+    } catch (e) {
+        console.error("SQL Error:", e.message, "SQL:", sql, "Params:", params);
+        throw e;
+    }
 };
 // Helper for 'run'
 const dbRun = (sql, params) => {
@@ -85,14 +91,22 @@ const checkRole = (allowedRoles) => (req, res, next) => {
 
 // Login
 router.post('/login', (req, res) => {
+    // console.log("Login Attempt:", req.body);
     const { username, password } = req.body;
     try {
         const user = dbGet("SELECT * FROM users WHERE username = ? AND password = ?", [username, password]);
         if (!user) {
-            return res.status(401).json({ error: 'Invalid credentials' });
+            // Debug: Check if table even has users
+            const count = dbGet("SELECT COUNT(*) as c FROM users");
+            return res.status(401).json({
+                error: 'Invalid credentials',
+                received_username: username,
+                db_user_count: count ? count.c : 'unknown'
+            });
         }
         res.json({ user });
     } catch (e) {
+        console.error("Login Error:", e);
         res.status(500).json({ error: e.message });
     }
 });
@@ -188,8 +202,8 @@ router.get('/dashboard', (req, res) => {
             res.json({ inventory, raw_transactions: transactions });
         }
     } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: e.message });
+        console.error("Dashboard Error:", e);
+        res.status(500).json({ error: e.message, stack: e.stack, where: "dashboard_route" });
     }
 });
 
