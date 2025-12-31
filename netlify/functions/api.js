@@ -1,1 +1,1 @@
-export const handler = require("../../server/index").handler;
+exports.handler = require("../../server/index").handler;

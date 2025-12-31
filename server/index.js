@@ -263,4 +263,14 @@ router.get('/history', (req, res) => {
 });
 
 app.use('/api', router);
+
+// Export for Netlify Functions
 module.exports.handler = serverless(app);
+
+// Allow local execution
+if (require.main === module) {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
