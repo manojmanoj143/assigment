@@ -1,0 +1,21 @@
+[build]
+  # Publish the client's build output
+  publish = "client/dist"
+  # Dependencies are installed via root package.json automatically
+  # Build command triggers client build
+  command = "npm run build"
+  # Functions directory
+  functions = "netlify/functions"
+
+# Route API requests to the Netlify Function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# React Router catch-all (valid for client/dist)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
