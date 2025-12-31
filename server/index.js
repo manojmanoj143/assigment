@@ -1,23 +1,99 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const db = require('./db');
+const serverless = require('serverless-http');
+const sqlite3 = require('sqlite3').verbose();
+
+// Use In-Memory DB for Netlify Functions (Since FS is read-only/ephemeral)
+const db = new sqlite3.Database(':memory:');
+
+// Initialize DB Schema (Since it resets every time)
+db.serialize(() => {
+    // Enable Foreign Keys
+    db.run("PRAGMA foreign_keys = ON");
+
+    // 1. Bases
+    db.run(`CREATE TABLE IF NOT EXISTS bases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        location TEXT
+    )`);
+
+    // 2. Users
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        role TEXT, -- 'admin', 'logistics', 'commander'
+        base_id INTEGER,
+        FOREIGN KEY(base_id) REFERENCES bases(id)
+    )`);
+
+    // 3. Assets (Catalog)
+    db.run(`CREATE TABLE IF NOT EXISTS assets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        type TEXT, -- 'vehicle', 'weapon', 'ammo'
+        description TEXT
+    )`);
+
+    // 4. Inventory
+    db.run(`CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        base_id INTEGER,
+        asset_id INTEGER,
+        quantity INTEGER DEFAULT 0,
+        UNIQUE(base_id, asset_id)
+    )`);
+
+    // 5. Transactions (History)
+    db.run(`CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT, -- 'PURCHASE', 'TRANSFER', 'ASSIGN', 'EXPEND'
+        asset_id INTEGER,
+        source_base_id INTEGER,
+        dest_base_id INTEGER,
+        quantity INTEGER,
+        user_id INTEGER,
+        date DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // SEED DATA
+    db.get("SELECT count(*) as count FROM bases", [], (err, row) => {
+        if (row && row.count === 0) {
+            console.log("Seeding In-Memory Database...");
+            db.run("INSERT INTO bases (name, location) VALUES ('Alpha Base', 'Sector 1')");
+            db.run("INSERT INTO bases (name, location) VALUES ('Bravo Base', 'Sector 2')");
+            db.run("INSERT INTO bases (name, location) VALUES ('Command HQ', 'Capital')");
+
+            db.run("INSERT INTO users (username, password, role, base_id) VALUES ('admin', 'admin123', 'admin', 3)");
+            db.run("INSERT INTO users (username, password, role, base_id) VALUES ('logistics', 'pass123', 'logistics', 2)");
+            db.run("INSERT INTO users (username, password, role, base_id) VALUES ('commander', 'pass123', 'commander', 1)");
+
+            db.run("INSERT INTO assets (name, type, description) VALUES ('M4 Carbine', 'weapon', 'Standard issue rifle')");
+            db.run("INSERT INTO assets (name, type, description) VALUES ('Humvee', 'vehicle', 'Tactical transport')");
+            db.run("INSERT INTO assets (name, type, description) VALUES ('5.56mm Ammo', 'ammo', 'Crate of 1000 rounds')");
+
+            // Initial Stock
+            db.run("INSERT INTO inventory (base_id, asset_id, quantity) VALUES (1, 1, 50)"); // Alpha has 50 Rifles
+            db.run("INSERT INTO inventory (base_id, asset_id, quantity) VALUES (2, 2, 5)");  // Bravo has 5 Humvees
+        }
+    });
+});
 
 const app = express();
-const PORT = 5000;
+const router = express.Router();
 
 app.use(cors());
 app.use(bodyParser.json());
 
 // Middleware for logging
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    // console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
 });
 
 // Mock Authentication/RBAC Middleware
-// In a real app, this would verify a JWT token.
-// Here we expect a header 'X-Role' and 'X-Base-ID' for simplicity in this demo.
 const checkRole = (allowedRoles) => (req, res, next) => {
     const userRole = req.headers['x-role'];
     if (!userRole || (allowedRoles.length > 0 && !allowedRoles.includes(userRole))) {
@@ -27,9 +103,10 @@ const checkRole = (allowedRoles) => (req, res, next) => {
 };
 
 // --- APIs ---
+// Use router for /api path prefix handling in Netlify Functions
 
-// Login (Mock)
-app.post('/api/login', (req, res) => {
+// Login
+router.post('/login', (req, res) => {
     const { username, password } = req.body;
     db.get("SELECT * FROM users WHERE username = ? AND password = ?", [username, password], (err, user) => {
         if (err || !user) {
@@ -47,7 +124,7 @@ app.post('/api/login', (req, res) => {
 });
 
 // Get Bases
-app.get('/api/bases', (req, res) => {
+router.get('/bases', (req, res) => {
     db.all("SELECT * FROM bases", [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
@@ -55,7 +132,7 @@ app.get('/api/bases', (req, res) => {
 });
 
 // Get Assets
-app.get('/api/assets', (req, res) => {
+router.get('/assets', (req, res) => {
     db.all("SELECT * FROM assets", [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
@@ -63,11 +140,10 @@ app.get('/api/assets', (req, res) => {
 });
 
 // Dashboard Stats
-app.get('/api/dashboard', (req, res) => {
-    const baseId = req.query.base_id; // Optional filter by base
-    const type = req.query.type; // Optional filter by asset type
+router.get('/dashboard', (req, res) => {
+    const baseId = req.query.base_id;
+    const type = req.query.type;
 
-    // 1. Current Balances
     let inventoryQuery = `
         SELECT a.name, a.type, SUM(i.quantity) as current_balance
         FROM inventory i
@@ -85,18 +161,11 @@ app.get('/api/dashboard', (req, res) => {
     }
     inventoryQuery += " GROUP BY a.id";
 
-    // 2. Net Movements (Purchases + In - Out) - This is complex to aggregate in one go, 
-    // but we can fetch transaction sums.
-
-    // We will return inventory first, then fetch movements.
     db.all(inventoryQuery, inventoryParams, (err, inventory) => {
         if (err) return res.status(500).json({ error: err.message });
 
-        // Fetch movements
         let transQuery = `
-            SELECT 
-                t.type, 
-                SUM(t.quantity) as total 
+            SELECT t.type, SUM(t.quantity) as total 
             FROM transactions t
             LEFT JOIN assets a ON t.asset_id = a.id
             WHERE 1=1
@@ -104,12 +173,6 @@ app.get('/api/dashboard', (req, res) => {
         const transParams = [];
 
         if (baseId) {
-            // For Transfers, we need to handle source vs dest
-            // If baseId is specified:
-            // PURCHASE: dest_base_id = baseId
-            // TRANSFER_IN: dest_base_id = baseId
-            // TRANSFER_OUT: source_base_id = baseId
-            // ASSIGN/EXPEND: dest_base_id (or source) - usually source for these.
             transQuery += ` AND (t.dest_base_id = ? OR t.source_base_id = ?)`;
             transParams.push(baseId, baseId);
         }
@@ -123,30 +186,13 @@ app.get('/api/dashboard', (req, res) => {
         db.all(transQuery, transParams, (err, transactions) => {
             if (err) return res.status(500).json({ error: err.message });
 
-            // Format movements
-            const movements = {
-                purchased: 0,
-                transferred_in: 0,
-                transferred_out: 0,
-                assigned: 0,
-                expended: 0
-            };
+            const movements = { purchased: 0, transferred_in: 0, transferred_out: 0, assigned: 0, expended: 0 };
 
+            // (Simplification for Netlify/Memory stats)
             transactions.forEach(t => {
                 if (t.type === 'PURCHASE') movements.purchased += t.total;
-                if (t.type === 'TRANSFER_IN') movements.transferred_in += t.total; // Note: In DB we might store TRANSFER, and infer IN/OUT based on base. 
-                // Let's assume we store TRANSFER and check base_id logic purely on read, 
-                // BUT current schema has 'TRANSFER_IN'/'TRANSFER_OUT' as types? 
-                // Implementation Details: 
-                // If I store 'TRANSFER', I count it as IN if dest_base_id == filter_base, OUT if source_base_id == filter_base.
-                // If types are explicit, it's easier.
-                // Let's stick to using 'TRANSFER' type for both, and distinguish query-side if baseId is present.
-                // However, the prompt asked for "Net Movements (Purchases + Transfer In - Transfer Out)".
-
-                // My Schema has `type`. I'll use 'TRANSFER' in DB and derive labels here.
             });
 
-            // Re-query for explicit IN/OUT if baseId is present
             if (baseId) {
                 db.all(`
                     SELECT 
@@ -167,15 +213,9 @@ app.get('/api/dashboard', (req, res) => {
                     if (err) return res.status(500).json({ error: err.message });
 
                     const stats = {
-                        opening_balance: 0, // This would be calculated: Closing - Net Movement
+                        opening_balance: 0,
                         closing_balance: inventorySize(inventory),
-                        movements: {
-                            purchased: 0,
-                            transfer_in: 0,
-                            transfer_out: 0,
-                            assigned: 0,
-                            expended: 0
-                        }
+                        movements: { purchased: 0, transfer_in: 0, transfer_out: 0, assigned: 0, expended: 0 }
                     };
 
                     preciseRows.forEach(r => {
@@ -186,14 +226,11 @@ app.get('/api/dashboard', (req, res) => {
                         if (r.movement_type === 'EXPEND') stats.movements.expended = r.total;
                     });
 
-                    // Net Movement
                     const net = stats.movements.purchased + stats.movements.transfer_in - stats.movements.transfer_out;
-                    stats.opening_balance = stats.closing_balance - net; // Approximately
-
+                    stats.opening_balance = stats.closing_balance - net;
                     res.json(stats);
                 });
             } else {
-                // Global view
                 res.json({ inventory, raw_transactions: transactions });
             }
         });
@@ -204,17 +241,13 @@ function inventorySize(rows) {
     return rows.reduce((acc, r) => acc + r.current_balance, 0);
 }
 
-
 // Purchase
-app.post('/api/purchases', checkRole(['admin', 'logistics']), (req, res) => {
+router.post('/purchases', checkRole(['admin', 'logistics']), (req, res) => {
     const { asset_id, base_id, quantity, user_id } = req.body;
-
     db.serialize(() => {
-        // 1. Add Transaction
         db.run(`INSERT INTO transactions (type, asset_id, dest_base_id, quantity, user_id) VALUES ('PURCHASE', ?, ?, ?, ?)`,
             [asset_id, base_id, quantity, user_id]);
 
-        // 2. Update Inventory
         db.run(`INSERT INTO inventory (base_id, asset_id, quantity) VALUES (?, ?, ?) 
                 ON CONFLICT(base_id, asset_id) DO UPDATE SET quantity = quantity + ?`,
             [base_id, asset_id, quantity, quantity], (err) => {
@@ -225,20 +258,13 @@ app.post('/api/purchases', checkRole(['admin', 'logistics']), (req, res) => {
 });
 
 // Transfer
-app.post('/api/transfers', checkRole(['admin', 'logistics']), (req, res) => {
+router.post('/transfers', checkRole(['admin', 'logistics']), (req, res) => {
     const { asset_id, source_base_id, dest_base_id, quantity, user_id } = req.body;
-
-    // Direct execution - allowing negative inventory as per user request
     db.serialize(() => {
-        // Deduct from Source
         db.run("UPDATE inventory SET quantity = quantity - ? WHERE base_id = ? AND asset_id = ?", [quantity, source_base_id, asset_id]);
-
-        // Add to Dest
         db.run(`INSERT INTO inventory (base_id, asset_id, quantity) VALUES (?, ?, ?) 
                 ON CONFLICT(base_id, asset_id) DO UPDATE SET quantity = quantity + ?`,
             [dest_base_id, asset_id, quantity, quantity]);
-
-        // Log Transaction
         db.run(`INSERT INTO transactions (type, asset_id, source_base_id, dest_base_id, quantity, user_id) 
                 VALUES ('TRANSFER', ?, ?, ?, ?, ?)`,
             [asset_id, source_base_id, dest_base_id, quantity, user_id], (err) => {
@@ -249,17 +275,12 @@ app.post('/api/transfers', checkRole(['admin', 'logistics']), (req, res) => {
 });
 
 // Assignments/Expenditure
-app.post('/api/assignments', checkRole(['admin', 'commander']), (req, res) => {
-    const { asset_id, base_id, quantity, type, user_id } = req.body; // type = ASSIGN or EXPEND
-
-    // Direct execution - allowing negative inventory as per user request
+router.post('/assignments', checkRole(['admin', 'commander']), (req, res) => {
+    const { asset_id, base_id, quantity, type, user_id } = req.body;
     db.serialize(() => {
         if (type === 'EXPEND') {
-            // Remove from inventory
             db.run("UPDATE inventory SET quantity = quantity - ? WHERE base_id = ? AND asset_id = ?", [quantity, base_id, asset_id]);
         }
-        // For ASSIGN, we just log it as per previous logic.
-
         db.run(`INSERT INTO transactions (type, asset_id, source_base_id, quantity, user_id) 
                 VALUES (?, ?, ?, ?, ?)`,
             [type, asset_id, base_id, quantity, user_id], (err) => {
@@ -270,7 +291,7 @@ app.post('/api/assignments', checkRole(['admin', 'commander']), (req, res) => {
 });
 
 // History
-app.get('/api/history', (req, res) => {
+router.get('/history', (req, res) => {
     const { base_id } = req.query;
     let query = `
         SELECT t.*, a.name as asset_name, u.username as user_name,
@@ -295,10 +316,9 @@ app.get('/api/history', (req, res) => {
     });
 });
 
-app.get('/', (req, res) => {
-    res.send('Backend Server is Running. Please use the Frontend application (usually port 5173).');
-});
+// Mount router at /api
+app.use('/api', router);
 
-app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-});
+// Export for Serverless
+module.exports.handler = serverless(app);
+
