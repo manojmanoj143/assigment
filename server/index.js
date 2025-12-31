@@ -200,7 +200,7 @@ router.post('/purchases', checkRole(['admin', 'logistics']), (req, res) => {
         dbRun("INSERT INTO transactions (type, asset_id, dest_base_id, quantity, user_id, date) VALUES ('PURCHASE', ?, ?, ?, ?, NOW())",
             [asset_id, base_id, quantity, user_id]);
 
-        upsertInventory(baseId, assetId, quantity);
+        upsertInventory(base_id, asset_id, quantity);
         res.json({ message: 'Purchase recorded' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
